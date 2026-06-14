@@ -7,12 +7,14 @@ Tools package — each module exports:
 from . import list_directory
 from . import create_file
 from . import read_file
+from . import summarize_file
 
 # Collect all tool definitions for the API
 definitions = [
     list_directory.definition,
     create_file.definition,
     read_file.definition,
+    summarize_file.definition,
 ]
 
 # Dispatch map: tool name → handler function
@@ -20,4 +22,5 @@ dispatch = {
     "list_directory": list_directory.handler,
     "create_file": create_file.handler,
     "read_file": read_file.handler,
+    "summarize_file": summarize_file.handler,
 }
