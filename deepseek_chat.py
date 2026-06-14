@@ -20,6 +20,8 @@ if not API_KEY:
     print("Set it with: set DEEPSEEK_API_KEY=your_api_key_here")
     sys.exit(1)
 
+MODEL = "deepseek-v4-pro"
+
 client = OpenAI(
     api_key=API_KEY,
     base_url="https://api.deepseek.com/v1",
@@ -31,19 +33,28 @@ SYSTEM_PROMPT = """You are a code generation agent. You can ONLY do the followin
 
 1. List the contents of a directory (`list_directory`)
 2. Read the contents of a file (`read_file`)
-3. Create a new file with content (`create_file`) — use this to write any code the user asks for
+3. Create a new file with content (`create_file`)
 
-Rules:
-- When the user asks you to write code, generate the code and use `create_file` to save it to a file.
-- You can list directories and read files to help users explore the workspace before deciding what to create.
-- You CANNOT answer general questions, explain concepts, provide information, or do anything outside of the three tools above. Stick to writing code, listing directories, and reading files only.
+**CRITICAL — NEVER guess or assume parameter values.**
+Before calling any tool, you MUST ask the user for every required parameter that is not explicitly specified:
+
+- `list_directory` → ask "Which directory would you like me to list?"
+- `read_file` → ask "Which file would you like me to read?"
+- `create_file` → ask "What file path should I create?" AND "What content should I write?"
+
+Do NOT proceed with a tool call until the user has provided all required information.
+Do NOT use default values (like current directory ".") unless the user explicitly says so.
+Do NOT make up file names, paths, or content on your own.
+
+Other rules:
+- You CANNOT answer general questions, explain concepts, provide information, or do anything outside of the three tools above.
 - If a user asks you to do something other than these three actions, politely refuse.
 - Be concise and direct.
 
 Your ONLY available tools:
 - `list_directory(path)` — List the contents of a directory
 - `read_file(path)` — Read the contents of a file
-- `create_file(path, content)` — Create a new file with the given content (use this for writing code)"""
+- `create_file(path, content)` — Create a new file with the given content"""
 
 messages = [
     {"role": "system", "content": SYSTEM_PROMPT},
@@ -58,16 +69,18 @@ print("=" * 60)
 # ─── LLM Helpers ────────────────────────────────────────────────────────────
 
 
-def call_llm() -> tuple[str | None, list | None]:
-    """Call the LLM and return (text_content, tool_calls)."""
+def call_llm() -> tuple[str | None, list | None, str | None]:
+    """Call the LLM and return (text_content, tool_calls, reasoning_content)."""
     response = client.chat.completions.create(
-        model="deepseek-chat",
+        model=MODEL,
         messages=messages,
         tools=TOOLS,
         temperature=0.7,
     )
     msg = response.choices[0].message
-    return msg.content, msg.tool_calls
+    # DeepSeek v4 pro returns reasoning_content in model_extra for thinking mode
+    reasoning = msg.model_extra.get("reasoning_content") if msg.model_extra else None
+    return msg.content, msg.tool_calls, reasoning
 
 
 def process_tool_calls(tool_calls) -> list[dict]:
@@ -98,23 +111,28 @@ def process_tool_calls(tool_calls) -> list[dict]:
     return results
 
 
-def stream_response():
-    """Stream the assistant's final response to the console and return the full text."""
+def stream_response() -> tuple[str, str | None]:
+    """Stream the assistant's final response and return (full_text, reasoning_content)."""
     print("\n🤖 Agent: ", end="", flush=True)
     stream = client.chat.completions.create(
-        model="deepseek-v4-pro",
+        model=MODEL,
         messages=messages,
         stream=True,
         temperature=0.7,
     )
     full = ""
+    reasoning = ""
     for chunk in stream:
-        if chunk.choices[0].delta.content:
-            text = chunk.choices[0].delta.content
-            print(text, end="", flush=True)
-            full += text
+        delta = chunk.choices[0].delta
+        if delta.content:
+            print(delta.content, end="", flush=True)
+            full += delta.content
+        if delta.model_extra:
+            rc = delta.model_extra.get("reasoning_content")
+            if rc:
+                reasoning += rc
     print()
-    return full
+    return full, reasoning or None
 
 
 # ─── Main Loop ──────────────────────────────────────────────────────────────
@@ -134,7 +152,7 @@ try:
 
         # Agent loop — keep calling the LLM until we get a text response
         while True:
-            content, tool_calls = call_llm()
+            content, tool_calls, reasoning = call_llm()
 
             if tool_calls:
                 assistant_msg = {
@@ -142,13 +160,19 @@ try:
                     "content": content,
                     "tool_calls": [tc.model_dump() for tc in tool_calls],
                 }
+                if reasoning:
+                    assistant_msg["reasoning_content"] = reasoning
                 messages.append(assistant_msg)
                 messages.extend(process_tool_calls(tool_calls))
                 continue
 
             if content:
-                full = stream_response()
-                messages.append({"role": "assistant", "content": full})
+                full, stream_reasoning = stream_response()
+                assistant_msg = {"role": "assistant", "content": full}
+                final_reasoning = stream_reasoning or reasoning
+                if final_reasoning:
+                    assistant_msg["reasoning_content"] = final_reasoning
+                messages.append(assistant_msg)
             break
 
 except KeyboardInterrupt:
